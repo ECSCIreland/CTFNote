@@ -31,17 +31,20 @@ function getDbUrl(role: "user" | "admin") {
   return `postgres://${login}:${password}@${config.db.host}:${config.db.port}/${config.db.database}`;
 }
 
-function createOptions() {
-  let secret: string;
-  if (config.sessionSecret.length < 64 && config.env !== "development") {
+// The secret PostGraphile uses to sign/verify JWTs. Resolved once and shared
+// with the API-key middleware so the JWTs it mints are accepted here.
+function resolveJwtSecret(): string {
+  if (config.env === "development") return "DEV";
+  if (config.sessionSecret.length < 64) {
     console.info(
       "Using random session secret since SESSION_SECRET is too short. All users will be logged out."
     );
-    secret = crypto.randomBytes(32).toString("hex");
-  } else {
-    secret = config.sessionSecret;
+    return crypto.randomBytes(32).toString("hex");
   }
+  return config.sessionSecret;
+}
 
+function createOptions(secret: string) {
   const postgraphileOptions: PostGraphileOptions = {
     pluginHook: makePluginHook([PgPubsub, OperationHook]),
     subscriptions: true,
@@ -79,7 +82,6 @@ function createOptions() {
     postgraphileOptions.retryOnInitFail = true;
     postgraphileOptions.enhanceGraphiql = true;
     postgraphileOptions.allowExplain = true;
-    postgraphileOptions.jwtSecret = "DEV";
     postgraphileOptions.showErrorStack = "json" as const;
     postgraphileOptions.extendedErrors = [
       "severity",
@@ -111,50 +113,86 @@ function createOptions() {
   return postgraphileOptions;
 }
 
+function base64url(input: string): string {
+  return Buffer.from(input).toString("base64url");
+}
+
+// Mint a short-lived JWT matching PostGraphile's expectations for the
+// `ctfnote.jwt` type (claims user_id + role), signed HS256 with the same
+// secret PostGraphile verifies with, and audience "postgraphile".
+function signApiKeyJwt(
+  claims: { user_id: number; role: string },
+  secret: string
+): string {
+  const now = Math.floor(Date.now() / 1000);
+  const header = base64url(JSON.stringify({ alg: "HS256", typ: "JWT" }));
+  const payload = base64url(
+    JSON.stringify({
+      user_id: claims.user_id,
+      role: claims.role,
+      aud: "postgraphile",
+      iat: now,
+      exp: now + 300,
+    })
+  );
+  const signature = crypto
+    .createHmac("sha256", secret)
+    .update(`${header}.${payload}`)
+    .digest("base64url");
+  return `${header}.${payload}.${signature}`;
+}
+
 /*
- * Authenticate a request from an `X-API-Key` header.
+ * Authenticate a request presenting an `X-API-Key` header.
  *
- * API keys are long-lived credentials (see migration 57-api-keys.sql). We look
- * the key up and return the same PostgreSQL session settings that a JWT would
- * produce, so the existing role/permission checks apply unchanged. A missing or
- * unknown key yields no settings, leaving the request anonymous (or falling
- * back to a JWT in the Authorization header, if present).
+ * API keys are long-lived credentials (see migration 57-api-keys.sql). When a
+ * valid key is presented (and no Authorization header is already set), we mint
+ * a short-lived JWT for its owner and inject it as `Authorization: Bearer ...`,
+ * so PostGraphile's normal JWT path handles it and every existing permission
+ * check applies unchanged. A missing/unknown key is left untouched, so the
+ * request stays anonymous (or uses its own JWT).
  *
- * A dedicated header is used on purpose: PostGraphile tries to parse
- * `Authorization: Bearer ...` as a JWT and would reject an API key there.
+ * A dedicated header is used on purpose: PostGraphile would try to parse an
+ * API key sent in `Authorization` as a JWT and reject it.
  */
-function makeApiKeyPgSettings(pool: Pool) {
-  return async (req: IncomingMessage): Promise<Record<string, string>> => {
+function makeApiKeyMiddleware(pool: Pool, secret: string) {
+  return async (
+    req: IncomingMessage,
+    _res: unknown,
+    next: (err?: unknown) => void
+  ): Promise<void> => {
     const header = req.headers["x-api-key"];
     const token = Array.isArray(header) ? header[0] : header;
-    if (!token) return {};
+    if (!token || req.headers.authorization) {
+      next();
+      return;
+    }
     try {
       const { rows } = await pool.query(
         "SELECT user_id, role FROM ctfnote_private.api_key_claims($1)",
         [token]
       );
-      if (rows.length === 0) return {};
-      const { user_id, role } = rows[0];
-      return {
-        role,
-        "jwt.claims.user_id": String(user_id),
-        "jwt.claims.role": role,
-      };
+      if (rows.length > 0) {
+        const { user_id, role } = rows[0];
+        req.headers.authorization = `Bearer ${signApiKeyJwt(
+          { user_id, role },
+          secret
+        )}`;
+      }
     } catch (e) {
       console.error("API key validation failed", e);
-      return {};
     }
+    next();
   };
 }
 
-function createApp(postgraphileOptions: PostGraphileOptions) {
+function createApp(postgraphileOptions: PostGraphileOptions, secret: string) {
   const pool = new Pool({
     connectionString: getDbUrl("user"),
   });
 
-  postgraphileOptions.pgSettings = makeApiKeyPgSettings(pool);
-
   const app = express();
+  app.use(makeApiKeyMiddleware(pool, secret));
   app.use(graphqlUploadExpress());
   app.use(
     "/uploads",
@@ -190,8 +228,9 @@ async function main() {
     console.log("Migrations done. Exiting.");
     return;
   }
-  const postgraphileOptions = createOptions();
-  const app = createApp(postgraphileOptions);
+  const secret = resolveJwtSecret();
+  const postgraphileOptions = createOptions(secret);
+  const app = createApp(postgraphileOptions, secret);
 
   await initDiscordBot();
 
