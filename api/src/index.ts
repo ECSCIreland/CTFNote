@@ -17,6 +17,7 @@ import uploadScalar from "./plugins/uploadScalar";
 import { Pool } from "pg";
 import { IncomingMessage } from "http";
 import { icalRoute } from "./routes/ical";
+import { restRoutes } from "./routes/rest";
 import ConnectionFilterPlugin from "postgraphile-plugin-connection-filter";
 import OperationHook from "@graphile/operation-hooks";
 import discordHooks from "./discord/hooks";
@@ -165,6 +166,7 @@ function createApp(postgraphileOptions: PostGraphileOptions) {
   );
   app.use(postgraphile(pool, "ctfnote", postgraphileOptions));
   app.use("/calendar.ics", icalRoute(pool));
+  app.use("/api", restRoutes());
   return app;
 }
 
