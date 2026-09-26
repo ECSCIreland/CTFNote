@@ -223,7 +223,9 @@ export function restRoutes(): Router {
       const tagged = await callGraphql(
         keyOf(req),
         `mutation($input:AddTagsForTaskInput!){ addTagsForTask(input:$input){ clientMutationId } }`,
-        { input: { taskId: task.id, tags } }
+        // NB: the GraphQL field is `taskid` (lowercase) -- Postgres folds the
+        // unquoted `taskId` argument name of ctfnote.add_tags_for_task.
+        { input: { taskid: task.id, tags } }
       );
       if (tagged.errors) {
         res.status(207).json({
