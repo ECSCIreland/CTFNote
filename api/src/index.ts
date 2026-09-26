@@ -15,6 +15,7 @@ import importCtfPlugin from "./plugins/importCtf";
 import uploadLogoPlugin from "./plugins/uploadLogo";
 import uploadScalar from "./plugins/uploadScalar";
 import { Pool } from "pg";
+import { IncomingMessage } from "http";
 import { icalRoute } from "./routes/ical";
 import ConnectionFilterPlugin from "postgraphile-plugin-connection-filter";
 import OperationHook from "@graphile/operation-hooks";
@@ -109,10 +110,48 @@ function createOptions() {
   return postgraphileOptions;
 }
 
+/*
+ * Authenticate a request from an `X-API-Key` header.
+ *
+ * API keys are long-lived credentials (see migration 57-api-keys.sql). We look
+ * the key up and return the same PostgreSQL session settings that a JWT would
+ * produce, so the existing role/permission checks apply unchanged. A missing or
+ * unknown key yields no settings, leaving the request anonymous (or falling
+ * back to a JWT in the Authorization header, if present).
+ *
+ * A dedicated header is used on purpose: PostGraphile tries to parse
+ * `Authorization: Bearer ...` as a JWT and would reject an API key there.
+ */
+function makeApiKeyPgSettings(pool: Pool) {
+  return async (req: IncomingMessage): Promise<Record<string, string>> => {
+    const header = req.headers["x-api-key"];
+    const token = Array.isArray(header) ? header[0] : header;
+    if (!token) return {};
+    try {
+      const { rows } = await pool.query(
+        "SELECT user_id, role FROM ctfnote_private.api_key_claims($1)",
+        [token]
+      );
+      if (rows.length === 0) return {};
+      const { user_id, role } = rows[0];
+      return {
+        role,
+        "jwt.claims.user_id": String(user_id),
+        "jwt.claims.role": role,
+      };
+    } catch (e) {
+      console.error("API key validation failed", e);
+      return {};
+    }
+  };
+}
+
 function createApp(postgraphileOptions: PostGraphileOptions) {
   const pool = new Pool({
     connectionString: getDbUrl("user"),
   });
+
+  postgraphileOptions.pgSettings = makeApiKeyPgSettings(pool);
 
   const app = express();
   app.use(graphqlUploadExpress());
